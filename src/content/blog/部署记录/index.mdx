@@ -272,336 +272,12 @@ docker images
 
 
 
-# Open WebUI
 
-## Docker 部署
 
-1. docker-compose.yml:
 
-```bash
-  # ===== Open WebUI：多用户聊天界面 =====
-  open-webui:
-    【要下的镜像版本；官方建议使用如下固定版本号，不使用main等浮动标签】
-    image: ghcr.io/open-webui/open-webui:v0.8.9
-    container_name: open-webui
-    environment:
-      - OLLAMA_BASE_URL=http://ollama:11434   # 告诉 WebUI 去哪里找 Ollama
-      - WEBUI_AUTH=true                       # 开启登录认证（必须有账号才能用）
-      - WEBUI_SECRET_KEY=CHANGE_THIS_TO_64_RANDOM_CHARS  # 加密密钥，下面会生成
-      - WEBUI_SESSION_COOKIE_SECURE=false      # 只通过 HTTPS 传递登录 Cookie
-      - ENABLE_ADMIN_EXPORT=true              # 管理员可以导出对话记录（用于审计）
-    【添加下面两行：huggingface国内镜像源（要下embedding模型）】
-      - HF_ENDPOINT=https://hf-mirror.com
-      - SENTENCE_TRANSFORMERS_HOME=/app/backend/data/cache/embedding/models
-    volumes:
-      - /data/open-webui:/app/backend/data   # 数据存到 8TB 硬盘
-    ports:
-      - "127.0.0.1:3000:8080"                # 仅本机可访问
-    depends_on:
-      - ollama                               # 等 Ollama 启动后再启动 WebUI
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-    restart: unless-stopped
-```
+## Ollama部署
 
-*: WEBUI_SESSION_COOKIE_SECURE 改成false（为什么）
-
-*：deploy：没下cuda版open-ui，不知道有没有用
-
-2：生成安全密钥并填入docker-compose配置文件
-
-```bash
-openssl rand -hex 32
-sed -i 's/CHANGE_THIS_TO_64_RANDOM_CHARS/YOUR_KEY_HERE/' docker-compose.yml
-```
-
-3: 部署 open-webui 镜像
-
-```bash
-# 1. 通过docker国内镜像源加速下载
-docker compose pull open-webui
-docker compose up -d open-webui
-sleep 60
-
-# 2. 或者通过国内镜像源部署(渡渡鸟，尽量不用）
-docker pull swr.cn-north-4.myhuaweicloud.com/ddn-k8s/ghcr.io/open-webui/open-webui:v0.8.9
-# 给镜像打上原始标签
-docker tag swr.cn-north-4.myhuaweicloud.com/ddn-k8s/ghcr.io/open-webui/open-webui:v0.8.9 ghcr.io/open-webui/open-webui:v0.8.9
-docker compose up -d open-webui
-sleep 60
-```
-
-如果日志最后几行出现类似Uvicorn running on0.0.0.0:8080的字样，说明启动成功
-
-4: 管理员注册
-
-1. [http://127.0.0.1:3000](http://127.0.0.1:3000)
-
-geespace/geespace (16678970081@163.com)
-
-- 管理员设置
-
-## 本地模型配置
-
-vllm：
-1. 因为兼容openai接口，所以在管理员面板--设置--外部连接--启用“OpenAl接口”--添加接口url：http://vllm:8000/v1--验证连接
-2. 因为vllm和openweb ui在同一个docker compose网络下，所以直接用vllm的容器名vllm作为IP地址即可
-ollama：
-3. 管理员面板--设置--外部连接--启用“Ollama接口”；url为 http://ollama:11434
-
-## 网络配置
-
-通过nginx反向代理：
-
-```bash
-# 安装nginx
-sudo apt install -y nginx
-nginx -v
-# 确认本机内网 IP
-ip addr show | grep 'inet ' | grep -v '127.0.0.1'
-# 生成自签名 TLS 证书（有效期 10 年）
-# 1. 创建证书目录
-sudo mkdir -p /etc/nginx/ssl
-
-# 2. 生成自签名证书
-sudo openssl req -x509 -nodes -days 3650 -newkey rsa:4096 \
-  -keyout /etc/nginx/ssl/ai.key \
-  -out /etc/nginx/ssl/ai.crt \
-  -subj "/C=CN/ST=Beijing/O=Company/CN=10.139.105.12" \
-  -addext "subjectAltName=IP:10.139.105.12,IP:127.0.0.1"
-  
-# 创建nginx配置文件
-sudo nano /etc/nginx/sites-available/ai-stack
-```
-
-- server_name要换成本机内网IP
-- openclaw网页端添加路由接口
-
-```
-# HTTP → HTTPS 跳转
-server {
-    listen 80;
-    server_name 【本机内网IP】;
-    return 301 https://$host$request_uri;
-}
-
-# HTTPS 主配置
-server {
-    listen 443 ssl;
-    server_name 【本机内网IP】;
-
-    # TLS 证书
-    ssl_certificate     /etc/nginx/ssl/ai.crt;
-    ssl_certificate_key /etc/nginx/ssl/ai.key;
-    ssl_protocols       TLSv1.2 TLSv1.3;
-
-    # 只允许内网 IP 段访问，拒绝一切外部访问
-    allow 192.168.0.0/16;   # 内网 C 类网段
-    allow 10.0.0.0/8;       # 内网 A 类网段
-    allow 172.16.0.0/12;
-    allow 127.0.0.1;
-    deny  all;              # 其余全部拒绝
-
-    # / 路由 → Open WebUI 聊天界面
-    location / {
-        proxy_pass         http://127.0.0.1:3000;
-        proxy_http_version 1.1;
-        proxy_set_header   Upgrade $http_upgrade;
-        proxy_set_header   Connection 'upgrade';
-        proxy_set_header   Host $host;
-        proxy_set_header   X-Real-IP $remote_addr;
-        proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header   X-Forwarded-Proto $scheme;
-        proxy_cache_bypass $http_upgrade;
-        # AI 流式回答需要关闭缓冲，否则会攒一大段才一次性返回
-        proxy_buffering    off;
-        # 大模型生成长回复可能耗时较久，10 分钟超时兜底
-        proxy_read_timeout 600s;
-        proxy_send_timeout 600s;
-
-    }
-
-    # /claw/ 路由 → OpeClaw Agent 接口
-    location /claw/ {
-        proxy_pass         http://127.0.0.1:18789/;
-        proxy_http_version 1.1;
-        proxy_set_header   Host $host;
-    }
-}
-
-
-# WebSocket 升级映射
-
-map $http_upgrade $connection_upgrade {
-default upgrade;
-''      close;
-}
-```
-
-- listen 80 自动 301 跳转 HTTPS
-- listen 443 ssl 启用 TLS 加密
-- allow 192.168.0.0/16 + 10.0.0.0/8 只放行内网 IP
-- deny all 拒绝一切非内网连接
-- location / proxy_pass 到 `http://127.0.0.1:3000`（Open WebUI）
-
-启用配置：
-
-```bash
-sudo ln -s /etc/nginx/sites-available/ai-stack /etc/nginx/sites-enabled/
-sudo rm -f /etc/nginx/sites-enabled/default
-sudo nginx -t
-sudo systemctl reload nginx
-sudo systemctl enable nginx
-```
-
-验证访问：
-
-- 本机验证：`curl -k https://127.0.0.1/`，应返回 Open WebUI HTML
-- 在浏览器打开 `https://内网IP`，接受证书警告后应看到登录页面
-
-## 出现的问题
-
-1. open-webui 打不开网页：重新部署后要生成新的WEBUI_SECRET_KEY
-2. 回答显示no text generated：更新open-webui版本
-3. 回答一直在loading：
-    1. 看open-webui和ollama的日志有没有报错
-    2. 直接运行ollama看是否输出正常, 输出卡住的话重启docker compose试一下
-
-`curl [http://127.0.0.1:11434/api/generate](http://127.0.0.1:11434/api/generate) -d '{"model":"qwen3.5:27b","prompt":"你好","stream":false}'`
-
-c. 看ollama容器的显卡调用情况 docker exec docker nvidia-smi
-# Vllm
-
-## docker下载镜像
-
-1. 修改docker-compose.yml的tag
-
-```
-services:
-  vllm:
-    image: vllm/vllm-openai:v0.19.0-x86_64-cu130-ubuntu2404
-
-```
-
-## 离线部署Docker镜像版本-科学
-
-1. docker hub确认需要的tag
-    1. 如果一个tag下包含了两种架构要注明需要的platform 架构是什么（linux/amd64）：docker pull --platform linux/amd64 vllm/vllm-openai:v0.18.1-cu130
-    2. 或者直接使用带架构名的tag：docker pull vllm/vllm-openai:v0.19.0-x86_64-cu130-ubuntu2404
-    3. 注意：如果用qwen3.5的话，要用vllm的nightly版本！Qwen3.5 = MoE + 新架构（Qwen3_5MoeForConditionalGeneration）需要 **vLLM nightly**，老版本不支持
-2. 导出为压缩文件
-
-docker save vllm/vllm-openai:v0.18.1-cu130 | gzip > vllm-v0.18.1-cu130.tar.gz
-
-3. 上传目标服务器
-
-```bash
-# 方式1：scp
-scp vllm-v0.18.1-cu130.tar.gz user@目标机器IP:/data/docker-images
-注意不要放到系统盘下了
-
-# 方式2：rsync（大文件推荐，支持断点续传）
-rsync -avP vllm-v0.18.1-cu130.tar.gz user@目标机器IP:/data/docker-images
-
-# 方式3：U盘 / 移动硬盘直接拷贝
-```
-
-4. 内网目标机器— 导入并运行
-
-```bash
-# 1. 导入镜像（docker load 自动识别 gzip 格式）
-docker load -i /data/docker-images/vllm-v0.18.1-cu130.tar.gz
-
-# 2. 确认镜像已导入
-docker images | grep vllm
-```
-
-docker-compose.yml
-
-```
-services:
-  vllm:
-    image: vllm/vllm-openai:v0.18.1-cu130
-    platform: linux/amd64
-    container_name: vllm
-    runtime: nvidia
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-    ports:
-      - "8000:8000"
-    ipc: host
-    environment:
-    # 国内hf镜像地址
-      - HF_ENDPOINT=https://hf-mirror.com
-    volumes:
-      - /data/models/huggingface:/root/.cache/huggingface
-```
-
-## 通过镜像源加载模型
-
-```
-services:
-  vllm:
-    image: vllm/vllm-openai:v0.18.1-cu130
-    platform: linux/amd64
-    container_name: vllm
-    runtime: nvidia
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-    command: >
-      --model Qwen/Qwen3.5-9B
-      --host 0.0.0.0
-      --port 8000
-      --enforce-eager
-      --max-model-len 2048
-```
-
-验证
-
-1. docker logs -f vllm
-2. docker exec vllm curl [http://localhost:8000/v1/models](http://localhost:8000/v1/models)
-3. 接口文档 [http://localhost:8000/docs](http://localhost:8000/docs)
-
-## 注意点
-1. docker-compose里使用：--model Qwen/Qwen3.5-9b 是远程huggingfaceid，加载vllm会默认先到huggingface上加载，如果下载好后，之后启动加载本地缓存模型的话要修改
-``` bash
-# 获取snapshots ID
-docker exec -it vllm bash
-# /root/.cache/huggingface是容器内模型的挂载点
-ls /root/.cache/huggingface/hub/models--Qwen--Qwen3.5-9B/snapshots/
-
-# 退出容器，修改docker-compose
-command: >
-  --model /root/.cache/huggingface/hub/models--Qwen--Qwen3.5-9B/snapshots/【上一步返回的结果】
-```
-
-2. curl (7) failed to connect to localhost port 8000 容器没有启动成功，看容器日志
-3. 显存不足
-	1. 换模型
-	2. 降上下文
-	3. 限制并发：--max-num-seqs 1
-	4. 降低显存利用率：--gpu-mempry-utilization 0.85
-	5. 查看是否有
-	6. 减少pytoch碎片：environment： - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-
-# Ollama部署
-
-## 安装Ollama到宿主机
+### 安装Ollama到宿主机
 
 通过modelscope（国内）：可能不是最新版
 
@@ -633,7 +309,7 @@ ollama serve &
 
 curl [http://localhost:11434](http://localhost:11434) ("Ollama is running.")
 
-## 通过Docker安装（国内镜像源）
+### 通过Docker安装（国内镜像源）
 
 1. 配置docker国内镜像源
 2. docker-compose
@@ -661,7 +337,7 @@ services:
 3. docker compose pull ollama
 4. docker compose up -d ollama
 
-## 下载模型
+### 下载模型
 
 1. ollama官网下载
     1. ollama run qwen3.5:4b
@@ -675,210 +351,11 @@ services:
 
 下载量化模型：ollama run modelscope.cn/unsloth/Qwen3.5-9B-GGUF
 
-# AI工具
 
-## vscode 集成cc
 
-方法1：安装cc插件，设置：edit in setting.json，里面设置其他模型（需要用第三方mcp server）
+## 其他
 
-方法2:
-
-1. cursor（composer）: 直接在cursor官网购买后在ide里选择模型
-
-## openclaude本地部署
-
-1. 安装：[https://docs.openclaw.ai/install#npm-pnpm](https://docs.openclaw.ai/install#npm-pnpm)
-2. 购买模型 token
-    
-    2. 以minimax为例：购买coding plan
-    3. minimax对应的openclaw 配置教程：[https://platform.minimaxi.com/docs/coding-plan/openclaw](https://platform.minimaxi.com/docs/coding-plan/openclaw)
-    4. 配置channel：飞书
-        1. 飞书开放平台： [https://open.feishu.cn/?lang=zh-CN](https://open.feishu.cn/?lang=zh-CN)
-        2. 添加机器人
-        3. 添加应用权限
-        4. 发布应用
-        5. openclaw 配置好后，飞书开放平台--事件与回调--事件：长链接--添加事件：“接收消息”--发布新版本
-    5. 常用命令：
-        1. openclaw gateway: 开启网关
-        2. openclaw gateway stop： 停止网关
-        3. openclaw dashbord: 打开control ui；生成网关token，配置在control ui（[http://127.0.0.1:18789](http://127.0.0.1:18789/chat?session=agent%3Amain%3Amain)）里的网关--token里
-        4. 新建终端窗口：openclaw tui；使用terminal对话网关
-        5. openclaw channels logout: 退出channel登陆； openclaw channels login：登陆
-    6. control ui：
-        1. 聊天：网页版对话网关
-    7. tui：
-        1. /：查看常用操作：切换agent、切换模型等
-        2. /models：切换模型
-        3. openclaw config：配置新模型等
-        4. 修改完即得重启
-
-## Hermes+飞书
-
-Hermes：[https://hermes-agent.nousresearch.com/docs/getting-started/quickstart](https://hermes-agent.nousresearch.com/docs/getting-started/quickstart)
-
-飞书集成：[https://hermes-doc.aigc.green/user-guide/messaging/feishu](https://hermes-doc.aigc.green/user-guide/messaging/feishu)
-
-[https://www.feishu.cn/content/article/7628541877674953666](https://www.feishu.cn/content/article/7628541877674953666)
-
-- 消息平台：接入飞书bot
-- **安装飞书 CLI（上下文+操作权限）**
-
-模型provider：https://www.volcengine.com/docs/82379/2318283?lang=zh（选coding plan）
-
-- 火山引擎两套API接入方式
-    - 按量计费 / 免费额度，Base URL填 [https://ark.cn-beijing.volces.com/api/v3](https://ark.cn-beijing.volces.com/api/v3)
-    - 月度套餐 coding plan： [https://ark.cn-beijing.volces.com/api/coding/v3](https://ark.cn-beijing.volces.com/api/coding/v3)
-- mimimax coding plan
-
-## dify本地部署
-
-1. 使用docker compose部署dify
-    1. [https://docs.dify.ai/zh/self-host/quick-start/docker-compose](https://docs.dify.ai/zh/self-host/quick-start/docker-compose)
-    2. 进入wsl
-    3. 获取镜像：
-        1. sudo apt install jqcd ~(这一步目的是防止将dify克隆到wins文件系统中/跨文件系统挂载)，或定位到将dify项目保存到的目录下，不要放在系统盘
-        2. 方法1: github拉取：git clone --branch "$(curl -s https://api.github.com/repos/langgenius/dify/releases/latest | jq -r .tag_name)" https://github.com/langgenius/dify.git（这一步会在当前文件夹下新建一个dify文件夹）
-        3. 方法2: 从科学上网电脑上拉取后将文件夹传到需要部署的电脑上
-        4. cd dify/docker
-
-cp .env.example .env
-
-v. 关闭数据上报：sed -i 's/DISABLE_TELEMETRY=false/DISABLE_TELEMETRY=true/' ~/dify/docker/.env
-
-验证 grep DISABLE_TELEMETRY ~/dify/docker/.env
-
-2. 启动容器：
-    1. docker compose up -d
-    2. 浏览器打开[http://localhost/install](http://localhost/install进行dify管理员注册) 进行dify管理员注册 16678970081@163.com/maria/GeeSpace123
-
-16678970081@163.com/admin/geespace123
-
-3. 如果报错端口占用，修改dify/docker里的.env文件
-
-```
-sudo sed -i 's/EXPOSE_NGINX_PORT=.*/EXPOSE_NGINX_PORT=9080/' .env
-sudo sed -i 's/EXPOSE_NGINX_SSL_PORT=.*/EXPOSE_NGINX_SSL_PORT=9081/' .env
-```
-
-4. 运行docker compose up -d重启
-5. 打开 [http://localhost:9080/install](http://localhost/install进行dify管理员注册) 注册
-6. 连接dify docker到ollama
-
-## ai应用本地化配置
-
-1. 连接本地llm
-    1. 配置ollama监听所有网卡
-
-sudo systemctl edit ollama.service
-
-在# [Service]下一行添加# Environment="OLLAMA_HOST=0.0.0.0"
-
-执行sudo systemctl restart ollama
-
-2. ai 工具配置：以Dify为例
-    1. 管理界面配置模型供应商：
-
-设置 -- 模型供应商 -- 安装模型供应商：Ollama
-
-ii. 点击添加模型
-
-模型名称：qwen3.5:4b
-
-模型类型：LLM（对话）
-
-BaseURL：[http://host.docker.internal:11434（Docker](http://host.docker.internal:11434（Docker) Compose 部署时）
-
-[http://localhost:11434](http://localhost:11434) （源码开发时，进程直接运行在 WSL2 中）
-
-c. 其他从同一局域网内访问应用（临时）
-
-i. 建立转发通道:
-
-a). 获取wsl2内部ip:
-
-进入wsl
-
-执行 ip addr show eth0 | grep "inet"（返回inet 172.22.167.69/20... )
-
-b). wins管理员执行:
-
-netsh interface portproxy add v4tov4 listenaddress=0.0.0.0 listenport=80 connectaddress=【换成wsl内部ip】 connectport=80（示例：netsh interface portproxy add v4tov4 listenaddress=0.0.0.0 listenport=80 connectaddress=172.22.167.69 connectport=80）
-
-c). 验证：netsh interface portproxy show all
-
-返回：侦听 ipv4: 连接到 ipv4:
-
-地址 端口 地址 端口
-
-0.0.0.0 80 172.22.167.69 80
-
-d). 获取本机ip地址:
-
-ipconfig（IPv4 地址）
-
-替换 ai 应用地址localhost：如dify [http://10.139.96.191/chat/HLDbVglz7F1DeYZQ](http://10.139.96.191/chat/HLDbVglz7F1DeYZQ)
-
-d: 其他从同一局域网内访问应用（永久）
-
-1. docker desktop设置开机启动
-2. 设置dify docker compose开机自启动（win：）
-    1. 查看WSL 发行版名称（通过 `wsl -l -v` 查看）：Ubuntu-24.04
-    2. wsl -d 【WSL 发行版名称】 -- bash -c "cd ~/dify/docker && docker compose up -d"
-3. 在 Windows 上创建脚本文件： `C:\Scripts\wsl2-port-forward.ps1`
-
-```bash
-$wslIp = (wsl -d [WSL发行版名称] -- hostname -I).Trim().Split(" ")[0]
-
-if (-not $wslIp) {
-    Write-Host "无法获取 WSL2 IP，退出"
-    exit 1
-}
-
-Write-Host "WSL2 IP: $wslIp"
-
-# 删除旧的端口转发规则
-netsh interface portproxy delete v4tov4 listenaddress=0.0.0.0 listenport=80
-
-# 添加新的端口转发规则（指向最新的 WSL2 IP）
-netsh interface portproxy add v4tov4 listenaddress=0.0.0.0 listenport=80 connectaddress=$wslIp connectport=80
-
-```
-
-- 验证：
-    - 查看转发规则：netsh interface portproxy show all
-    - 查看WSL地址：wsl -d 【WSL 发行版名称】 -- hostname -I
-    - 二者相同
-
-d: 设置 Windows 开机自动执行该脚本
-
-1. 打开"任务计划程序" (`taskschd.msc`)
-2. 点击"创建任务"（不是"创建基本任务"）
-3. 常规选项卡：
-    - 名称：`WSL2 Port Forward`
-    - 勾选"使用最高权限运行"（必须，因为 netsh 需要管理员权限）
-    - 配置为：Windows 10/11
-4. 触发器选项卡：
-    - 新建 -> 选择"登录时"
-    - 可选：延迟任务 30 秒（给 WSL 和 Docker 足够启动时间）
-5. 操作选项卡：
-    - 新建 -> 启动程序
-    - 程序输入：`powershell.exe`
-    - 参数输入：`-ExecutionPolicy Bypass -File "C:\Scripts\wsl2-port-forward.ps1"`
-6. 条件选项卡：
-    - 取消勾选"只有在计算机使用交流电源时才启动"
-7. 确认保存
-
-e. 确保 Windows 防火墙放行 80 端口
-
-```powershell
-New-NetFirewallRule -DisplayName "WSL2 Dify" -Direction Inbound -LocalPort 80 -Protocol TCP -Action Allow
-```
-
-- 运行后重启生效
-
-# 其他
-
-## gitee加速github下载
+### gitee加速github下载
 
 1. 复制github项目链接
 2. 切换到 Gitee，在右上角点击「+」号，选择「从 GitHub / GitLab 导入仓库」。
@@ -891,9 +368,9 @@ New-NetFirewallRule -DisplayName "WSL2 Dify" -Direction Inbound -LocalPort 80 -P
 3. 如果选择导入到自己的账户，需要在下方的是否开源选项中勾选「公开」，然后点击导入。
 4. 导入完成后，直接使用 Gitee 的链接替换掉 GitHub 原先的链接进行克隆，进行加速。
 
-# 部署环境
+## 部署环境
 
-## 5060
+### 5060
 
 dify：docker部署，wsl2，～/dify
 
@@ -901,7 +378,7 @@ ollama：宿主机，开机自启动
 
 models：qwen3.5:4b
 
-## 5090
+### 5090
 
 - CPU：Intel Ultra 7 265k（24核 Arrow Lake）
 - RAM：64GB DDR5
@@ -915,7 +392,7 @@ vllm：docker、/ai-stack
 
 models：qwen3.5-9b、qwen3.5-27b
 
-### 文件存储地址
+#### 文件存储地址
 
 |   |   |
 |---|---|
@@ -926,7 +403,7 @@ models：qwen3.5-9b、qwen3.5-27b
 |docker-compose.yml|/home/hello/ai-stack|
 |docker镜像压缩包|/docker-images|
 
-# 密码
+## 密码
 
 联想
 

@@ -1,0 +1,61 @@
+---
+title: "AI 工具安装"
+description: "Hermes, Claude Code, Openclaw,.."
+date: 2026-02-17
+authors: ['maria']
+---
+
+## AI工具
+
+### vscode 集成cc
+
+方法1：安装cc插件，设置：edit in setting.json，里面设置其他模型（需要用第三方mcp server）
+
+方法2:
+
+1. cursor（composer）: 直接在cursor官网购买后在ide里选择模型
+
+### openclaude本地部署
+
+1. 安装：[https://docs.openclaw.ai/install#npm-pnpm](https://docs.openclaw.ai/install#npm-pnpm)
+2. 购买模型 token
+    
+    2. 以minimax为例：购买coding plan
+    3. minimax对应的openclaw 配置教程：[https://platform.minimaxi.com/docs/coding-plan/openclaw](https://platform.minimaxi.com/docs/coding-plan/openclaw)
+    4. 配置channel：飞书
+        1. 飞书开放平台： [https://open.feishu.cn/?lang=zh-CN](https://open.feishu.cn/?lang=zh-CN)
+        2. 添加机器人
+        3. 添加应用权限
+        4. 发布应用
+        5. openclaw 配置好后，飞书开放平台--事件与回调--事件：长链接--添加事件：“接收消息”--发布新版本
+    5. 常用命令：
+        1. openclaw gateway: 开启网关
+        2. openclaw gateway stop： 停止网关
+        3. openclaw dashbord: 打开control ui；生成网关token，配置在control ui（[http://127.0.0.1:18789](http://127.0.0.1:18789/chat?session=agent%3Amain%3Amain)）里的网关--token里
+        4. 新建终端窗口：openclaw tui；使用terminal对话网关
+        5. openclaw channels logout: 退出channel登陆； openclaw channels login：登陆
+    6. control ui：
+        1. 聊天：网页版对话网关
+    7. tui：
+        1. /：查看常用操作：切换agent、切换模型等
+        2. /models：切换模型
+        3. openclaw config：配置新模型等
+        4. 修改完即得重启
+
+### Hermes+飞书
+
+Hermes：[https://hermes-agent.nousresearch.com/docs/getting-started/quickstart](https://hermes-agent.nousresearch.com/docs/getting-started/quickstart)
+
+飞书集成：[https://hermes-doc.aigc.green/user-guide/messaging/feishu](https://hermes-doc.aigc.green/user-guide/messaging/feishu)
+
+[https://www.feishu.cn/content/article/7628541877674953666](https://www.feishu.cn/content/article/7628541877674953666)
+
+- 消息平台：接入飞书bot
+- **安装飞书 CLI（上下文+操作权限）**
+
+模型provider：https://www.volcengine.com/docs/82379/2318283?lang=zh（选coding plan）
+
+- 火山引擎两套API接入方式
+    - 按量计费 / 免费额度，Base URL填 [https://ark.cn-beijing.volces.com/api/v3](https://ark.cn-beijing.volces.com/api/v3)
+    - 月度套餐 coding plan： [https://ark.cn-beijing.volces.com/api/coding/v3](https://ark.cn-beijing.volces.com/api/coding/v3)
+- mimimax coding plan

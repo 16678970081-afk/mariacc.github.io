@@ -1,0 +1,211 @@
+---
+title: "Openweb UI"
+description: ""
+date: 2026-03-09
+authors: ['maria']
+---
+
+## Open WebUI
+
+### Docker 部署
+
+1. docker-compose.yml:
+
+```bash
+  # ===== Open WebUI：多用户聊天界面 =====
+  open-webui:
+    【要下的镜像版本；官方建议使用如下固定版本号，不使用main等浮动标签】
+    image: ghcr.io/open-webui/open-webui:v0.8.9
+    container_name: open-webui
+    environment:
+      - OLLAMA_BASE_URL=http://ollama:11434   # 告诉 WebUI 去哪里找 Ollama
+      - WEBUI_AUTH=true                       # 开启登录认证（必须有账号才能用）
+      - WEBUI_SECRET_KEY=CHANGE_THIS_TO_64_RANDOM_CHARS  # 加密密钥，下面会生成
+      - WEBUI_SESSION_COOKIE_SECURE=false      # 只通过 HTTPS 传递登录 Cookie
+      - ENABLE_ADMIN_EXPORT=true              # 管理员可以导出对话记录（用于审计）
+    【添加下面两行：huggingface国内镜像源（要下embedding模型）】
+      - HF_ENDPOINT=https://hf-mirror.com
+      - SENTENCE_TRANSFORMERS_HOME=/app/backend/data/cache/embedding/models
+    volumes:
+      - /data/open-webui:/app/backend/data   # 数据存到 8TB 硬盘
+    ports:
+      - "127.0.0.1:3000:8080"                # 仅本机可访问
+    depends_on:
+      - ollama                               # 等 Ollama 启动后再启动 WebUI
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+```
+
+*: WEBUI_SESSION_COOKIE_SECURE 改成false（为什么）
+
+*：deploy：没下cuda版open-ui，不知道有没有用
+
+2：生成安全密钥并填入docker-compose配置文件
+
+```bash
+openssl rand -hex 32
+sed -i 's/CHANGE_THIS_TO_64_RANDOM_CHARS/YOUR_KEY_HERE/' docker-compose.yml
+```
+
+3: 部署 open-webui 镜像
+
+```bash
+# 1. 通过docker国内镜像源加速下载
+docker compose pull open-webui
+docker compose up -d open-webui
+sleep 60
+
+# 2. 或者通过国内镜像源部署(渡渡鸟，尽量不用）
+docker pull swr.cn-north-4.myhuaweicloud.com/ddn-k8s/ghcr.io/open-webui/open-webui:v0.8.9
+# 给镜像打上原始标签
+docker tag swr.cn-north-4.myhuaweicloud.com/ddn-k8s/ghcr.io/open-webui/open-webui:v0.8.9 ghcr.io/open-webui/open-webui:v0.8.9
+docker compose up -d open-webui
+sleep 60
+```
+
+如果日志最后几行出现类似Uvicorn running on0.0.0.0:8080的字样，说明启动成功
+
+4: 管理员注册
+
+1. [http://127.0.0.1:3000](http://127.0.0.1:3000)
+
+geespace/geespace (16678970081@163.com)
+
+- 管理员设置
+
+### 本地模型配置
+
+vllm：
+1. 因为兼容openai接口，所以在管理员面板--设置--外部连接--启用“OpenAl接口”--添加接口url：http://vllm:8000/v1--验证连接
+2. 因为vllm和openweb ui在同一个docker compose网络下，所以直接用vllm的容器名vllm作为IP地址即可
+ollama：
+3. 管理员面板--设置--外部连接--启用“Ollama接口”；url为 http://ollama:11434
+
+### 网络配置
+
+通过nginx反向代理：
+
+```bash
+# 安装nginx
+sudo apt install -y nginx
+nginx -v
+# 确认本机内网 IP
+ip addr show | grep 'inet ' | grep -v '127.0.0.1'
+# 生成自签名 TLS 证书（有效期 10 年）
+# 1. 创建证书目录
+sudo mkdir -p /etc/nginx/ssl
+
+# 2. 生成自签名证书
+sudo openssl req -x509 -nodes -days 3650 -newkey rsa:4096 \
+  -keyout /etc/nginx/ssl/ai.key \
+  -out /etc/nginx/ssl/ai.crt \
+  -subj "/C=CN/ST=Beijing/O=Company/CN=10.139.105.12" \
+  -addext "subjectAltName=IP:10.139.105.12,IP:127.0.0.1"
+  
+# 创建nginx配置文件
+sudo nano /etc/nginx/sites-available/ai-stack
+```
+
+- server_name要换成本机内网IP
+- openclaw网页端添加路由接口
+
+```
+# HTTP → HTTPS 跳转
+server {
+    listen 80;
+    server_name 【本机内网IP】;
+    return 301 https://$host$request_uri;
+}
+
+# HTTPS 主配置
+server {
+    listen 443 ssl;
+    server_name 【本机内网IP】;
+
+    # TLS 证书
+    ssl_certificate     /etc/nginx/ssl/ai.crt;
+    ssl_certificate_key /etc/nginx/ssl/ai.key;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+
+    # 只允许内网 IP 段访问，拒绝一切外部访问
+    allow 192.168.0.0/16;   # 内网 C 类网段
+    allow 10.0.0.0/8;       # 内网 A 类网段
+    allow 172.16.0.0/12;
+    allow 127.0.0.1;
+    deny  all;              # 其余全部拒绝
+
+    # / 路由 → Open WebUI 聊天界面
+    location / {
+        proxy_pass         http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+        proxy_set_header   Upgrade $http_upgrade;
+        proxy_set_header   Connection 'upgrade';
+        proxy_set_header   Host $host;
+        proxy_set_header   X-Real-IP $remote_addr;
+        proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+        proxy_cache_bypass $http_upgrade;
+        # AI 流式回答需要关闭缓冲，否则会攒一大段才一次性返回
+        proxy_buffering    off;
+        # 大模型生成长回复可能耗时较久，10 分钟超时兜底
+        proxy_read_timeout 600s;
+        proxy_send_timeout 600s;
+
+    }
+
+    # /claw/ 路由 → OpeClaw Agent 接口
+    location /claw/ {
+        proxy_pass         http://127.0.0.1:18789/;
+        proxy_http_version 1.1;
+        proxy_set_header   Host $host;
+    }
+}
+
+
+# WebSocket 升级映射
+
+map $http_upgrade $connection_upgrade {
+default upgrade;
+''      close;
+}
+```
+
+- listen 80 自动 301 跳转 HTTPS
+- listen 443 ssl 启用 TLS 加密
+- allow 192.168.0.0/16 + 10.0.0.0/8 只放行内网 IP
+- deny all 拒绝一切非内网连接
+- location / proxy_pass 到 `http://127.0.0.1:3000`（Open WebUI）
+
+启用配置：
+
+```bash
+sudo ln -s /etc/nginx/sites-available/ai-stack /etc/nginx/sites-enabled/
+sudo rm -f /etc/nginx/sites-enabled/default
+sudo nginx -t
+sudo systemctl reload nginx
+sudo systemctl enable nginx
+```
+
+验证访问：
+
+- 本机验证：`curl -k https://127.0.0.1/`，应返回 Open WebUI HTML
+- 在浏览器打开 `https://内网IP`，接受证书警告后应看到登录页面
+
+### 出现的问题
+
+1. open-webui 打不开网页：重新部署后要生成新的WEBUI_SECRET_KEY
+2. 回答显示no text generated：更新open-webui版本
+3. 回答一直在loading：
+    1. 看open-webui和ollama的日志有没有报错
+    2. 直接运行ollama看是否输出正常, 输出卡住的话重启docker compose试一下
+
+`curl [http://127.0.0.1:11434/api/generate](http://127.0.0.1:11434/api/generate) -d '{"model":"qwen3.5:27b","prompt":"你好","stream":false}'`
+
+c. 看ollama容器的显卡调用情况 docker exec docker nvidia-smi
+

@@ -1,0 +1,156 @@
+---
+title: "Dify的安装、使用与部署"
+description: ""
+date: 2026-04-10
+authors: ['maria']
+order: 1
+---
+
+
+## dify本地部署
+
+1. 使用docker compose部署dify
+    1. [https://docs.dify.ai/zh/self-host/quick-start/docker-compose](https://docs.dify.ai/zh/self-host/quick-start/docker-compose)
+    2. 进入wsl
+    3. 获取镜像：
+        1. sudo apt install jqcd ~(这一步目的是防止将dify克隆到wins文件系统中/跨文件系统挂载)，或定位到将dify项目保存到的目录下，不要放在系统盘
+        2. 方法1: github拉取：git clone --branch "$(curl -s https://api.github.com/repos/langgenius/dify/releases/latest | jq -r .tag_name)" https://github.com/langgenius/dify.git（这一步会在当前文件夹下新建一个dify文件夹）
+        3. 方法2: 从科学上网电脑上拉取后将文件夹传到需要部署的电脑上
+        4. cd dify/docker
+
+cp .env.example .env
+
+v. 关闭数据上报：sed -i 's/DISABLE_TELEMETRY=false/DISABLE_TELEMETRY=true/' ~/dify/docker/.env
+
+验证 grep DISABLE_TELEMETRY ~/dify/docker/.env
+
+2. 启动容器：
+    1. docker compose up -d
+    2. 浏览器打开[http://localhost/install](http://localhost/install进行dify管理员注册) 进行dify管理员注册 16678970081@163.com/maria/GeeSpace123
+
+16678970081@163.com/admin/geespace123
+
+3. 如果报错端口占用，修改dify/docker里的.env文件
+
+```
+sudo sed -i 's/EXPOSE_NGINX_PORT=.*/EXPOSE_NGINX_PORT=9080/' .env
+sudo sed -i 's/EXPOSE_NGINX_SSL_PORT=.*/EXPOSE_NGINX_SSL_PORT=9081/' .env
+```
+
+4. 运行docker compose up -d重启
+5. 打开 [http://localhost:9080/install](http://localhost/install进行dify管理员注册) 注册
+6. 连接dify docker到ollama
+
+
+
+### ai应用本地化配置
+
+1. 连接本地llm
+    1. 配置ollama监听所有网卡
+
+sudo systemctl edit ollama.service
+
+在# [Service]下一行添加# Environment="OLLAMA_HOST=0.0.0.0"
+
+执行sudo systemctl restart ollama
+
+2. ai 工具配置：以Dify为例
+    1. 管理界面配置模型供应商：
+
+设置 -- 模型供应商 -- 安装模型供应商：Ollama
+
+ii. 点击添加模型
+
+模型名称：qwen3.5:4b
+
+模型类型：LLM（对话）
+
+BaseURL：[http://host.docker.internal:11434（Docker](http://host.docker.internal:11434（Docker) Compose 部署时）
+
+[http://localhost:11434](http://localhost:11434) （源码开发时，进程直接运行在 WSL2 中）
+
+c. 其他从同一局域网内访问应用（临时）
+
+i. 建立转发通道:
+
+a). 获取wsl2内部ip:
+
+进入wsl
+
+执行 ip addr show eth0 | grep "inet"（返回inet 172.22.167.69/20... )
+
+b). wins管理员执行:
+
+netsh interface portproxy add v4tov4 listenaddress=0.0.0.0 listenport=80 connectaddress=【换成wsl内部ip】 connectport=80（示例：netsh interface portproxy add v4tov4 listenaddress=0.0.0.0 listenport=80 connectaddress=172.22.167.69 connectport=80）
+
+c). 验证：netsh interface portproxy show all
+
+返回：侦听 ipv4: 连接到 ipv4:
+
+地址 端口 地址 端口
+
+0.0.0.0 80 172.22.167.69 80
+
+d). 获取本机ip地址:
+
+ipconfig（IPv4 地址）
+
+替换 ai 应用地址localhost：如dify [http://10.139.96.191/chat/HLDbVglz7F1DeYZQ](http://10.139.96.191/chat/HLDbVglz7F1DeYZQ)
+
+d: 其他从同一局域网内访问应用（永久）
+
+1. docker desktop设置开机启动
+2. 设置dify docker compose开机自启动（win：）
+    1. 查看WSL 发行版名称（通过 `wsl -l -v` 查看）：Ubuntu-24.04
+    2. wsl -d 【WSL 发行版名称】 -- bash -c "cd ~/dify/docker && docker compose up -d"
+3. 在 Windows 上创建脚本文件： `C:\Scripts\wsl2-port-forward.ps1`
+
+```bash
+$wslIp = (wsl -d [WSL发行版名称] -- hostname -I).Trim().Split(" ")[0]
+
+if (-not $wslIp) {
+    Write-Host "无法获取 WSL2 IP，退出"
+    exit 1
+}
+
+Write-Host "WSL2 IP: $wslIp"
+
+# 删除旧的端口转发规则
+netsh interface portproxy delete v4tov4 listenaddress=0.0.0.0 listenport=80
+
+# 添加新的端口转发规则（指向最新的 WSL2 IP）
+netsh interface portproxy add v4tov4 listenaddress=0.0.0.0 listenport=80 connectaddress=$wslIp connectport=80
+
+```
+
+- 验证：
+    - 查看转发规则：netsh interface portproxy show all
+    - 查看WSL地址：wsl -d 【WSL 发行版名称】 -- hostname -I
+    - 二者相同
+
+d: 设置 Windows 开机自动执行该脚本
+
+1. 打开"任务计划程序" (`taskschd.msc`)
+2. 点击"创建任务"（不是"创建基本任务"）
+3. 常规选项卡：
+    - 名称：`WSL2 Port Forward`
+    - 勾选"使用最高权限运行"（必须，因为 netsh 需要管理员权限）
+    - 配置为：Windows 10/11
+4. 触发器选项卡：
+    - 新建 -> 选择"登录时"
+    - 可选：延迟任务 30 秒（给 WSL 和 Docker 足够启动时间）
+5. 操作选项卡：
+    - 新建 -> 启动程序
+    - 程序输入：`powershell.exe`
+    - 参数输入：`-ExecutionPolicy Bypass -File "C:\Scripts\wsl2-port-forward.ps1"`
+6. 条件选项卡：
+    - 取消勾选"只有在计算机使用交流电源时才启动"
+7. 确认保存
+
+e. 确保 Windows 防火墙放行 80 端口
+
+```powershell
+New-NetFirewallRule -DisplayName "WSL2 Dify" -Direction Inbound -LocalPort 80 -Protocol TCP -Action Allow
+```
+
+- 运行后重启生效

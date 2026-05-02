@@ -1,0 +1,267 @@
+---
+title: "基于dify的知识库创建"
+description: "（概念验证/单一文档检索）"
+date: 2026-04-10
+authors: ['maria']
+---
+
+## FTP 服务端同步
+1. 登陆dify
+    1. cd ~/dify/docker
+    2. docker compose up -d
+2. 创建同步文档文件夹
+
+```bash
+mkdir -p /mnt/d/dify-sync/docs
+mkdir -p /mnt/d/dify-sync/logs
+```
+
+3. 在 WSL 中安装 lftp
+
+在 WSL 终端执行：sudo apt update && sudo apt install -y lftp
+
+```bash
+lftp --version
+```
+
+4. 进入lftp，远程服务器
+
+```bash
+lftp -u "运控组,123456" ftp://10.139.203.199
+```
+
+- 长管日报服务器
+- IP：10.139.203.199
+- 端口：21
+- 账号：运控组
+- 密码：123456
+
+- 进入lftp命令行后，进行单次同步测试
+
+set ftp:charset gbk; set file:charset utf-8; mirror --verbose -I "_.doc" -I "_.docx" /3月 /mnt/d/dify-sync/docs
+
+- 执行成功后，检查本地是否收到了文件。**关于子文件夹**：mirror 默认递归同步，会自动保留远程的目录结构。
+- ftp:charset gbk：ftp服务端以gbk编码
+- file:charset utf-8：本端以utf8编码。
+- 设置这两行防止乱码
+
+## 2. 上传dify 知识库
+
+1. 获取知识库id
+2. 打开知识库网页：http://localhost/datasets/【知识库id】/documents
+3. 获取 知识库API Key
+4. [dify-官方文档](https://docs.dify.ai/zh/use-dify/knowledge/manage-knowledge/maintain-dataset-via-api#%E9%80%9A%E8%BF%87-api-%E7%BB%B4%E6%8A%A4%E7%9F%A5%E8%AF%86%E5%BA%93)
+5. 知识库--右上角：服务api--api密钥
+
+## 3. 同步+上传知识库
+
+脚本：sync-docs.sh
+
+```bash
+#!/bin/bash
+#
+# 功能：通过 FTP 从远程 Windows 服务器拉取新增/变更的 Word 文档，自动上传到 Dify 知识库
+#
+
+# ====== 配置区（改这里） ======
+FTP_USER="运控组"                           # FTP 用户名
+FTP_PASS="123456"                             # FTP 密码
+FTP_HOST="10.139.203.199"                  # 远程 Windows 服务器 IP
+FTP_REMOTE_DIR="/日报"                     # FTP 上的文档目录路径
+DATASET_ID="8c99af5d-591d-4967-8c5a-2f96540b4fa0"  # 长管日报知识库
+API_KEY="dataset-OP0uo18rhjPUQ7HH4V2Pxwpq"        # Dify API 密钥
+# ====== 配置区结束 ======
+
+SYNC_HOME="/mnt/d/dify-sync/docs/cg_daily_report"   # 存放同步的所有长管日志
+LOCAL_DIR="${SYNC_HOME}/docs"             # 文档本身
+STATE_FILE="${SYNC_HOME}/.last_sync_state"
+LOG_FILE="${SYNC_HOME}/logs/sync_$(date +%Y%m%d_%H%M%S).log"
+DIFY_API="http://localhost/v1"
+
+# 自动创建所需目录（防止因目录不存在导致脚本失败）
+mkdir -p "${LOCAL_DIR}"
+mkdir -p "$(dirname "${LOG_FILE}")"
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
+}
+
+log "========== 同步开始 =========="
+
+# ──────────────────────────────────────
+# 第一步：通过 FTP 从远程 Windows 服务器拉取文件
+# ──────────────────────────────────────
+log "正在通过 FTP 从 ${FTP_HOST} 拉取文档..."
+
+lftp -u "${FTP_USER},${FTP_PASS}" "ftp://${FTP_HOST}" -e "
+  set net:timeout 30;
+  set net:max-retries 3;
+  set ftp:passive-mode yes;
+  set ftp:charset gbk;
+  set file:charset utf-8;
+  mirror --only-newer --no-empty-dirs \
+    -I *.docx -I *.doc \
+    ${FTP_REMOTE_DIR} ${LOCAL_DIR};
+  exit
+" >> "$LOG_FILE" 2>&1
+
+if [ $? -ne 0 ]; then
+    log "错误：FTP同步失败，请检查网络连接和FTP账号密码"
+    exit 1
+fi
+log "文件拉取完成"
+
+# ──────────────────────────────────────
+# 第二步：生成当前文件的指纹清单
+# 用文件名 + 大小 + 修改时间来标识每个文件，用于判断哪些是新文件
+# ──────────────────────────────────────
+CURRENT_STATE=$(find "${LOCAL_DIR}" -type f \( -name "*.docx" -o -name "*.doc" \) \
+    -exec stat --format='%n|%s|%Y' {} \; 2>/dev/null | sort)
+
+if [ -z "$CURRENT_STATE" ]; then
+    CURRENT_STATE=$(find "${LOCAL_DIR}" -type f \( -name "*.docx" -o -name "*.doc" \) \
+        -exec stat -f '%N|%z|%m' {} \; 2>/dev/null | sort)
+fi
+
+if [ -z "$CURRENT_STATE" ]; then
+    log "未发现任何 .docx 或 .doc 文件，同步结束"
+    exit 0
+fi
+
+# ──────────────────────────────────────
+# 第三步：对比上次的记录，找出新增或修改过的文件
+# ──────────────────────────────────────
+if [ -f "$STATE_FILE" ]; then
+    PREVIOUS_STATE=$(cat "$STATE_FILE")
+else
+    PREVIOUS_STATE=""
+    log "首次运行，将上传所有文档"
+fi
+
+UPLOAD_COUNT=0
+FAIL_COUNT=0
+SKIP_COUNT=0
+
+while IFS= read -r line; do
+    [ -z "$line" ] && continue
+
+    FILE_PATH=$(echo "$line" | cut -d'|' -f1)
+    # 显示相对路径（如 "3月/报告.docx"），方便在日志中看到文件来自哪个子文件夹
+    REL_PATH="${FILE_PATH#${LOCAL_DIR}/}"
+
+    if echo "$PREVIOUS_STATE" | grep -qF "$line"; then
+        SKIP_COUNT=$((SKIP_COUNT + 1))
+        continue
+    fi
+
+    log "正在上传: ${REL_PATH}"
+
+    # ──────────────────────────────────────
+    # 第四步：调用 Dify API 上传文档
+    # 所有子目录里的 .docx/.doc 文件都会被逐个上传到同一个知识库
+    # ──────────────────────────────────────
+    RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+        "${DIFY_API}/datasets/${DATASET_ID}/document/create-by-file" \
+        -H "Authorization: Bearer ${API_KEY}" \
+        -F "file=@${FILE_PATH}" \
+        -F 'data={"indexing_technique":"high_quality","process_rule":{"mode":"automatic"}}')
+
+    HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+    BODY=$(echo "$RESPONSE" | head -n -1)
+
+    if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "201" ]; then
+        log "上传成功: ${REL_PATH}"
+        UPLOAD_COUNT=$((UPLOAD_COUNT + 1))
+    else
+        log "上传失败: ${REL_PATH} (HTTP ${HTTP_CODE}) - ${BODY}"
+        FAIL_COUNT=$((FAIL_COUNT + 1))
+    fi
+
+    sleep 2
+
+done <<< "$CURRENT_STATE"
+
+# ──────────────────────────────────────
+# 第五步：保存本次的文件状态，供下次运行时对比
+# ──────────────────────────────────────
+echo "$CURRENT_STATE" > "$STATE_FILE"
+
+log "========== 同步结束 =========="
+log "本次结果: ${UPLOAD_COUNT} 个上传成功, ${FAIL_COUNT} 个失败, ${SKIP_COUNT} 个无变化跳过"
+
+find "${SYNC_HOME}/logs/" -name "*.log" -mtime +30 -delete 2>/dev/null
+
+```
+
+手动测试脚本
+
+```bash
+bash /mnt/d/dify-sync/docs/cg_daily_report/sync-docs.sh
+```
+
+知识库相关api：[https://docs.dify.ai/api-reference/%E7%9F%A5%E8%AF%86%E5%BA%93/%E8%8E%B7%E5%8F%96%E7%9F%A5%E8%AF%86%E5%BA%93%E5%88%97%E8%A1%A8](https://docs.dify.ai/api-reference/%E7%9F%A5%E8%AF%86%E5%BA%93/%E8%8E%B7%E5%8F%96%E7%9F%A5%E8%AF%86%E5%BA%93%E5%88%97%E8%A1%A8)
+
+9 . 长管日报文件夹位置
+
+1. 长管日报文档home目录：/mnt/d/dify-sync/docs/cg_daily_report（/mnt/d 就是win里的d盘）
+2. 同步脚本：/mnt/d/dify-sync/docs/cg_daily_report/sync_docs.sh
+
+10 设置定时自动执行
+
+1. wsl执行：crontab -e，选nano
+2. 在打开的文件最后一行添加：0 17 * * * /bin/bash /mnt/d/dify-sync/docs/cg_daily_report/sync_docs.sh >> /mnt/d/dify-sync/docs/cg_daily_report/logs/cron.log 2>&1
+    1. 每天17:00 自动执行同步脚本。
+
+## 4. 出现的问题
+
+1. 网页登陆长时间加载图标
+    1. 重启dify：docker compose down && docker compose up -d
+2. 无法命中文档名
+    1. 知识库--添加内置元数据
+    2. workflow：知识检索节点--元数据过滤--手动/document_name 包含variable：提取关键词
+3. 批量上传文档后大部分文档显示“排队中”
+    1. 查看woker节点是否报错：docker logs docker-worker-1----无报错
+    2. 查看redis的priority_dataset中是否有积压任务：docker-compose exec docker-redis-1 redis-cli -n 1 llen priority_dataset ----返回21，正好是“排队中”的文档个数（0是正常的）
+    3. docker exec docker-worker-1 celery -A app.celery inspect stats：
+        1. 发现并发数和预取数过低：max-concurrency=1
+        2. worker单节点
+    4. 解决：如果存在批量上传时要增加并发数
+        1. 修改默认环境变量
+
+```
+cd ～/dify/docker
+nano .env
+# 原配置
+CELERY_WORKER_AMOUNT=
+CELERY_AUTO_SCALE=false
+
+# 修改为
+CELERY_WORKER_AMOUNT=4
+CELERY_AUTO_SCALE=true
+CELERY_MAX_WORKERS=8
+CELERY_MIN_WORKERS=2
+```
+
+ii. 全部重启：docker-compose down && docker-compose up -d
+
+e. 相关命令：
+
+- 清空任务队列（紧急情况使用）docker-compose exec redis redis-cli -n 1 del dataset
+- 检查队列任务数量 docker-compose exec redis redis-cli -n 1 llen dataset
+- 检查Worker状态 docker-compose exec worker celery -A app.celery inspect stats
+- 检查正在执行的任务 docker-compose exec worker celery -A app.celery inspect active
+- 检查系统资源使用情况 docker stats
+
+f. 排查步骤：
+
+检查Docker服务状态：docker-compose ps
+检查队列任务数量：docker-compose exec redis redis-cli -n 1 llen dataset
+检查Worker状态：docker-compose exec worker celery -A app.celery inspect stats
+检查Worker日志：docker-compose logs --tail=50 worker
+检查配置文件：cat .env | grep -i celery
+根据检查结果调整配置或增加worker进程
+
+参考：
+[https://developer.volcengine.com/articles/7533551130689667126](https://developer.volcengine.com/articles/7533551130689667126)
+[https://doc.ismoon.top/ai-kai-fa](https://doc.ismoon.top/ai-kai-fa)
+

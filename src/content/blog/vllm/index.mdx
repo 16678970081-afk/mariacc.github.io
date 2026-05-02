@@ -1,0 +1,130 @@
+---
+title: "vllm的安装、启动、参数优化"
+description: ""
+date: 2026-04-10
+authors: ['maria']
+---
+
+## Vllm
+
+### docker下载镜像
+
+1. 修改docker-compose.yml的tag
+
+```
+services:
+  vllm:
+    image: vllm/vllm-openai:v0.19.0-x86_64-cu130-ubuntu2404
+
+```
+
+### 离线部署Docker镜像版本-科学
+
+1. docker hub确认需要的tag
+    1. 如果一个tag下包含了两种架构要注明需要的platform 架构是什么（linux/amd64）：docker pull --platform linux/amd64 vllm/vllm-openai:v0.18.1-cu130
+    2. 或者直接使用带架构名的tag：docker pull vllm/vllm-openai:v0.19.0-x86_64-cu130-ubuntu2404
+    3. 注意：如果用qwen3.5的话，要用vllm的nightly版本！Qwen3.5 = MoE + 新架构（Qwen3_5MoeForConditionalGeneration）需要 **vLLM nightly**，老版本不支持
+2. 导出为压缩文件
+
+docker save vllm/vllm-openai:v0.18.1-cu130 | gzip > vllm-v0.18.1-cu130.tar.gz
+
+3. 上传目标服务器
+
+```bash
+# 方式1：scp
+scp vllm-v0.18.1-cu130.tar.gz user@目标机器IP:/data/docker-images
+注意不要放到系统盘下了
+
+# 方式2：rsync（大文件推荐，支持断点续传）
+rsync -avP vllm-v0.18.1-cu130.tar.gz user@目标机器IP:/data/docker-images
+
+# 方式3：U盘 / 移动硬盘直接拷贝
+```
+
+4. 内网目标机器— 导入并运行
+
+```bash
+# 1. 导入镜像（docker load 自动识别 gzip 格式）
+docker load -i /data/docker-images/vllm-v0.18.1-cu130.tar.gz
+
+# 2. 确认镜像已导入
+docker images | grep vllm
+```
+
+docker-compose.yml
+
+```
+services:
+  vllm:
+    image: vllm/vllm-openai:v0.18.1-cu130
+    platform: linux/amd64
+    container_name: vllm
+    runtime: nvidia
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    ports:
+      - "8000:8000"
+    ipc: host
+    environment:
+    # 国内hf镜像地址
+      - HF_ENDPOINT=https://hf-mirror.com
+    volumes:
+      - /data/models/huggingface:/root/.cache/huggingface
+```
+
+### 通过镜像源加载模型
+
+```
+services:
+  vllm:
+    image: vllm/vllm-openai:v0.18.1-cu130
+    platform: linux/amd64
+    container_name: vllm
+    runtime: nvidia
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    command: >
+      --model Qwen/Qwen3.5-9B
+      --host 0.0.0.0
+      --port 8000
+      --enforce-eager
+      --max-model-len 2048
+```
+
+验证
+
+1. docker logs -f vllm
+2. docker exec vllm curl [http://localhost:8000/v1/models](http://localhost:8000/v1/models)
+3. 接口文档 [http://localhost:8000/docs](http://localhost:8000/docs)
+
+### 注意点
+1. docker-compose里使用：--model Qwen/Qwen3.5-9b 是远程huggingfaceid，加载vllm会默认先到huggingface上加载，如果下载好后，之后启动加载本地缓存模型的话要修改
+``` bash
+# 获取snapshots ID
+docker exec -it vllm bash
+# /root/.cache/huggingface是容器内模型的挂载点
+ls /root/.cache/huggingface/hub/models--Qwen--Qwen3.5-9B/snapshots/
+
+# 退出容器，修改docker-compose
+command: >
+  --model /root/.cache/huggingface/hub/models--Qwen--Qwen3.5-9B/snapshots/【上一步返回的结果】
+```
+
+2. curl (7) failed to connect to localhost port 8000 容器没有启动成功，看容器日志
+3. 显存不足
+	1. 换模型
+	2. 降上下文
+	3. 限制并发：--max-num-seqs 1
+	4. 降低显存利用率：--gpu-mempry-utilization 0.85
+	5. 查看是否有
+	6. 减少pytoch碎片：environment： - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
