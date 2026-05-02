@@ -1,34 +1,44 @@
 name: Deploy to GitHub Pages
-
 on:
   push:
-    branches: [main]    # 或 master，按你的默认分支
-  workflow_dispatch:    # 允许手动触发
-
+    branches: [main]
+  workflow_dispatch:
 permissions:
   contents: read
   pages: write
   id-token: write
-
 concurrency:
   group: pages
   cancel-in-progress: false
-
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Install, build, and upload
-        uses: withastro/action@v3
-        # 默认参数已能覆盖大多数情况，特殊场景才需要：
+      - name: Setup Node
+        uses: actions/setup-node@v4
         with:
-        #   path: .                  # 项目根目录
-          node-version: 22         # Node 版本
-        #   package-manager: npm     # 或 pnpm@latest, yarn
-
+          node-version: '22'
+          cache: 'npm'
+      - name: Install dependencies
+        run: npm ci
+      - name: Build Astro site
+        run: npm run build
+      - name: Ensure .nojekyll exists in dist
+        run: touch dist/.nojekyll
+      - name: List dist contents (debug)
+        run: |
+          echo "=== dist/ root ==="
+          ls -la dist/
+          echo "=== check .nojekyll ==="
+          ls -la dist/.nojekyll
+          echo "=== _astro file count ==="
+          ls dist/_astro/ | wc -l
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ./dist
   deploy:
     needs: build
     runs-on: ubuntu-latest
