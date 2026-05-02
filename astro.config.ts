@@ -21,7 +21,7 @@ import tailwindcss from '@tailwindcss/vite'
 import type { PluginOption } from 'vite'
 
 export default defineConfig({
-  site: 'https://16678970081-afk.github.io',
+  site: 'https://mariallmm.github.io',
   // base: '/mariacc.github.io',
   // site: 'https://astro-erudite.vercel.app',
   integrations: [mdx(), react(), sitemap(), icon()],
