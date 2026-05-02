@@ -24,9 +24,9 @@ jobs:
       - name: Install, build, and upload
         uses: withastro/action@v3
         # 默认参数已能覆盖大多数情况，特殊场景才需要：
-        # with:
+        with:
         #   path: .                  # 项目根目录
-        #   node-version: 20         # Node 版本
+          node-version: 22         # Node 版本
         #   package-manager: npm     # 或 pnpm@latest, yarn
 
   deploy:
