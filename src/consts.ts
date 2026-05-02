@@ -7,7 +7,7 @@ export const SITE: Site = {
   href: 'https://mariallmm.github.io/',
   author: 'jktrn',
   locale: 'zh-Ch',
-  featuredPostCount: 2,
+  featuredPostCount: 3,
   postsPerPage: 3,
 }
 
