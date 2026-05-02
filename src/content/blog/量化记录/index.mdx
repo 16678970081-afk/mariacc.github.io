@@ -1,0 +1,334 @@
+---
+title: "量化记录"
+description: "Qwen3.5-27B的基于llim-compressor的AWQ量化."
+date: 2026-05-01
+authors: ['maria']
+---
+
+import Callout from '@/components/callout.astro'
+import { Icon } from 'astro-icon/components'
+
+## 环境部署
+
+### 1. Autodl
+
+1. 购买实例（https://www.autodl.com/market/list）
+	1. GPU 型号：`A800-PCIE-80GB` × 1 卡
+	2. 计费方式：按量计费（一次性任务，不要包日/包月)
+	3.  镜像: pytorch 2.8 / python 3.12 / ubuntu 22.04 / cuda 12.8
+	4.  数据盘扩容：50-100GB
+		1. 如果数据盘无法扩容了，用“文件系统”。如果是已经开机后才初始化文件系统，要重启实例才能挂载上，挂载地址:   /root/autodl-fs
+
+### 2. 准备
+
+0. 准备阶段：使用“更多”--“无卡开机”
+1. 创建并激活虚拟环境
+
+``` bash
+python -m venv quant
+source quant/bin/activate
+```
+
+2. 保存为kernel，Jupyter notebook选择创建的kernel
+
+``` bash
+pip install ipykernel
+python -m ipykernel install --user --name quant --display-name "Python (quant)"
+```
+
+3. modelscope下载原始模型
+	+ 放文件系统或数据盘
+```bash
+cd /root/autodl-tmp
+pip install modelscope -i https://pypi.tuna.tsinghua.edu.cn/simple
+modelscope download --model Qwen/Qwen3.5-27B --local_dir /root/autodl-fs/models/Qwen3.5-27B
+```
+
+4. 关机正常重启
+
+## 量化过程
+
+### 1. vllm量化要求
+
+文档：
++ https://docs.vllm.ai/en/latest/features/quantization/ （*中文站的文档过时了）
++ INT4 W4A16: https://docs.vllm.ai/en/latest/features/quantization/int4/
+
+### 2. 环境安装
+
+0. 激活quant虚拟环境
+1. 安装 llmcompressor 依赖
+	1. ` pip install llmcompressor -i https://pypi.tuna.tsinghua.edu.cn/simple`
+	2.  遇到的问题：
+		1. 加载模型时报错：ValueError: The checkpoint you are trying to load has model type `qwen3_5` but Transformers does not recognize this architecture. This could be because of an issue with the checkpoint, or because your version of Transformers is out of date. 要求升级 Transformers；升级后会再次报错：Transformers 最新5.x要求llmcompressor的版本为0.11以上，但是使用pip升级llmcompressor最新的也只能升级到0.10
+		2. 原因：llmcompressor 一起装的 transformers 还没有内置 Qwen3.5架构		
+		<Callout title="llmcompressor建议" variant="note">
+		"Qwen 3.5 can now be quantized using LLM Compressor. You will need to update your local transformers version using uv pip install --upgrade transformers and install LLM Compressor from source if using \<0.11."
+		</Callout>
+	3. 解决方法：
+		1. 参考issue：https://github.com/vllm-project/llm-compressor/issues/2535 ------先装源码、再升 transformers
+
+
+``` bash
+git clone https://github.com/vllm-project/llm-compressor.git
+cd llm-compressor
+pip install -e . -i https://pypi.tuna.tsinghua.edu.cn/simple
+pip install --upgrade transformers -i https://pypi.tuna.tsinghua.edu.cn/simple
+pip install --upgrade --pre compressed-tensors -i https://pypi.tuna.tsinghua.edu.cn/simple
+```
+
+### 3. 量化
+
+#### 1. 加载库
+``` python
+import torch  
+from datasets import load_dataset  
+from transformers import AutoTokenizer, Qwen3_5ForCausalLM  
+from llmcompressor import oneshot  
+from llmcompressor.modifiers.awq import AWQModifier
+```
+
+#### 2. 加载模型（text-only）
+
++ 纯文本的process选AutoTokenizer，没有图像输入，tokenizer 够用，如果多模态选AutoProcessor
+``` python
+MODEL_ID = "/root/autodl-fs/models/Qwen3.5-27B"
+
+model = Qwen3_5ForCausalLM.from_pretrained(
+	MODEL_ID,
+	dtype="auto",
+	device_map="auto",
+	trust_remote_code=True,
+)
+tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
+```
+遇到的问题：
+1. Qwen3.5-27B 是多模态 VLM，不是纯文本 llm。用` AutoModelForCausalLM `加载会有两个隐患:
+	1. . 它的顶层 model_type 是 qwen3_5（VLM 复合配置），文本子配置才是 qwen3_5_text。AutoModelForCausalLM 在新版 transformers 里通常会自动路由到 `Qwen3_5ForCausalLM`（仅文本部分），但也可能因为 config 路径报错。
+	2. 如果要做完整的多模态推理/量化，应该用 `Qwen3_5ForConditionalGeneration`。
+2. Qwen3_5ForCausalLM 内部声明 `keys_to_ignore_on_load_unexpected = [r"^model.visual.*"]`，所以可以直接从 VLM 完整 checkpoint 加载，vision 权重会被静默丢弃
+3. 量化时，显存不足oom：
+	1. 显式 CPU offload，让加载时就把部分层放 CPU，sequential pipeline 会按需搬运，max_memory 给 GPU 设上限到 55GB（一半模型 + 量化 workspace）；如果还不够，把 55GiB 改成 40GiB 让一半权重直接落 CPU。
+``` python add={5-6}
+model = Qwen3_5ForCausalLM.from_pretrained(
+    MODEL_ID,
+    dtype="auto",
+    device_map="auto",
+    max_memory={0: "55GiB", "cpu": "200GiB"},   # ← 主动给 GPU 留 25G 空间
+    offload_folder="/root/autodl-tmp/offload",   # 必要时落盘
+    offload_state_dict=True,
+    trust_remote_code=True,
+)
+```
+
+#### 3. 校准数据
+
++ AWQ 是数据驱动算法，如果是NVFP4A16就不需要数据校准了
+
+3.1 配置参数
+``` python
+NUM_CALIBRATION_SAMPLES = 512 # 27B MoE 建议 ≥ 512，dense 256 即可
+MAX_SEQUENCE_LENGTH = 2048
+```
+遇到的问题：
+* 量化时，显存不足 oom：把序列长度砍半（这一步省下的显存最多，激活内存随 seq_len 线性增长）：
+	+ NUM_CALIBRATION_SAMPLES降为256
+	+ MAX_SEQUENCE_LENGTH降为1024
+
+3.2 下载并加载数据集
+``` python
+ds = load_dataset(
+	"HuggingFaceH4/ultrachat_200k",
+	split=f"train_sft[:{NUM_CALIBRATION_SAMPLES}]",
+)
+ds = ds.shuffle(seed=42)
+```
+遇到的问题：
++ 网络问题无法下载-----从modelscope上下载数据集
+	+ swift/ultrachat_200k 是 HuggingFaceH4/ultrachat_200k 的镜像
+	+ `modelscope download --dataset 'swift/ultrachat_200k' --local_dir /root/autodl-fs/calib_data/ultrachat_200k`
+	+ 加载数据集时改成本地 parquet 加载
+``` python add={5}
+CALIB_DATA_DIR = "/root/autodl-fs/calib_data/ultrachat_200k"
+
+ds = load_dataset(
+	"parquet",
+	data_files=f"{CALIB_DATA_DIR}/data/train_sft-*.parquet",
+	split=f"train[:{NUM_CALIBRATION_SAMPLES}]",
+)
+ds = ds.shuffle(seed=42)
+```
+
+3.3
+``` python
+def preprocess(example):
+	return {
+		"text": tokenizer.apply_chat_template(
+		example["messages"], tokenize=False
+	)
+}
+
+def tokenize(sample):
+	return tokenizer(
+		sample["text"],
+		padding=False,
+		max_length=MAX_SEQUENCE_LENGTH,
+		truncation=True,
+		add_special_tokens=False,
+	)
+
+ds = ds.map(preprocess)
+ds = ds.map(tokenize, remove_columns=ds.column_names)
+```
+
+
+#### 4. awq压缩配置
+
++ scheme="W4A16" 在 compressed-tensors 里默认就是 INT4 对称分组(group_size=128)，这正是 vLLM 部署 INT4 LLM 的主流格式
+``` python
+recipe = AWQModifier(
+	targets=["Linear"],
+	scheme="W4A16",
+	ignore=[
+		"lm_head",# ↓ Qwen3.5 是 MoE，必须跳过 router gate（否则专家选择会崩）
+		"re:.*mlp\\.gate$",
+		"re:.*mlp\\.shared_experts\\.gate.*", # ↓ MTP（multi-token prediction）头如果存在也跳过
+		"re:^mtp\\..*",
+	],
+)
+```
+
+
+
+#### 5. ons-shot量化
+
+``` python add={3}
+oneshot(
+	model=model,
+	processor=tokenizer, # ← 新增这一行解决下面的报错
+	dataset=ds,
+	recipe=recipe,
+	max_seq_length=MAX_SEQUENCE_LENGTH,
+	num_calibration_samples=NUM_CALIBRATION_SAMPLES,
+)
+```
+遇到的问题：
++ 报错  RuntimeError: An error occurred when attempting to initialize model processor, which is required when a dataset is provided. To resolve, create and pass in a processor directly to `oneshot`/`train`.
+	+ 解决：显式把 tokenizer 传进去
+	+ 原因：llmcompressor 在 oneshot() 内部会自动调用 AutoProcessor.from_pretrained(model_path) 去拿一个 processor，用于校准 dataloader 和保存时写 tokenizer 配置。问题在于：1. Qwen3.5 是 VLM，AutoProcessor 期望同时找到 image_processor + tokenizer，但你用 Qwen3_5ForCausalLM 加载（仅文本），processor 自动初始化容易失败。2. 你已经手动 tokenize 过数据集（dataset 里有 input_ids 了），llmcompressor 仍坚持要一个 processor，因为它要把 tokenizer 一起存到量化产物里。核心源码逻辑（来自 entrypoints/utils.py）：
+``` python
+if isinstance(model_args.processor, (str, type(None))):
+	try:
+		model_args.processor = initialize_processor_from_path(...) # ← 这里炸了
+	except Exception as e:
+		if dataset_args.is_dataset_provided():
+			raise RuntimeError("...required when a dataset is provided...")
+```
+也就是说：只要 dataset 不为空 + 没显式传 processor，它必抛这个错。
++ 显存oom
+	1. 改序列长度
+	2. 加载模型时，显式CPU offload
+
+Qwen3.5-27B INT W4A16 (AWQ) 量化脚本
+- 仅量化语言部分（用 Qwen3_5ForCausalLM 加载，自动跳过 vision tower）
+- AWQ 算法，校准数据为 ultrachat 512 条
+- group_size=128 对称分组量化（compressed-tensors 默认）
+
+### 4. 验证
+
+``` python
+import torch
+from compressed_tensors.utils import save_mtp_tensors_to_checkpoint
+from compressed_tensors.offload import dispatch_model
+
+
+# ---------- 4.5. 量化后采样验证（先测能否正常生成）----------
+print("\n\n========== SAMPLE GENERATION ==============")
+
+# 把 oneshot 后还残留的 offload 状态归位,准备做推理
+# 量化后模型只有 ~14GB,完全能装进 80G 卡
+dispatch_model(model)
+
+messages = [
+    {"role": "user", "content": "用一段话介绍量化技术对大语言模型部署的意义。"}
+]
+
+# tokenizer 替代 processor:apply_chat_template 接口完全一致
+prompt = tokenizer.apply_chat_template(
+    messages,
+    tokenize=False,
+    add_generation_prompt=True,
+)
+
+# tokenizer(text=...) 替代 processor(text=...)
+inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+
+with torch.no_grad():
+    output = model.generate(
+        **inputs,
+        max_new_tokens=128,
+        do_sample=False,                        # 测精度用 greedy,可复现
+        pad_token_id=tokenizer.eos_token_id,
+    )
+
+print(tokenizer.decode(output[0], skip_special_tokens=True))
+print("==========================================\n\n")
+
+
+# ---------- 5. 保存量化后的模型 ----------
+SAVE_DIR = MODEL_ID.rstrip("/").split("/")[-1] + "-W4A16-INT-AWQ"
+
+model.save_pretrained(
+    SAVE_DIR,
+    save_compressed=True,            # 必须: 写出 INT4 packed 格式
+    max_shard_size="5GB",            # 推荐: 避开 50GB 警告
+    safe_serialization=True,
+)
+tokenizer.save_pretrained(SAVE_DIR)
+
+
+# ---------- 6. 把 MTP 层从原 checkpoint 拷回 ----------
+# Qwen3_5ForCausalLM 在加载时通过 _keys_to_ignore_on_load_unexpected = [r"^mtp.*"]
+# 把 MTP (Multi-Token Prediction) 层丢掉了,所以 quantized 输出里缺这些权重。
+# 这一步把原 fp16 的 MTP 权重直接拷过去(不量化),给 vLLM 做 speculative decoding 备用
+save_mtp_tensors_to_checkpoint(source_model=MODEL_ID, dest_dir=SAVE_DIR)
+
+```
+
+
+
+## LLM Compressor
+文档：
+AWQ 量化：https://docs.vllm.ai/en/latest/features/quantization/int4/
+Qwen3.5 NVFP4A16 Vision-Language Example：https://docs.vllm.ai/projects/llm-compressor/en/latest/key-models/qwen3.5/nvfp4-vl-example/
+
+https://docs.vllm.ai/projects/llm-compressor/en/latest/steps/choosing-model/
+1. 选择模型：
+	1. Qwen3.5-27B：多模态、moe
+2. 选择压缩schema：
+	1. **W4A16/W8A16**
+	2. 显卡：A800（80GB）
+	3. https://docs.vllm.ai/projects/llm-compressor/en/latest/steps/choosing-scheme/
+> NVIDIA Ampere
+> - **Minimum compute capability**: 8.0
+> - **Recommended**: W4A16 for memory reduction
+> - **Alternative**: W8A8-INT8 for weight and activation quantization
+3. 选择压缩算法： AWQ
+4. 选择数据集：
+	1. AWQ必须选数据集
+5. one shot 压缩
+
+
+## 模型下载/上传
+
+1. ssh 下载：
+	1. 复制ssh远程地址，用户名密码
+	2. 命令行执行：
+``` bash
+rsync -avzP -e "ssh -p 33004" root@connect.nma1.seetacloud.com:/root/autodl-tmp/Qwen3.5-27B-W4A16-INT-AWQ/Qwen3.5-27B-W4A16-INT-AWQ/
+```
+
+2. 上传modelscope
+	1. 创建模型，获取model id
+	2. modelscope upload owner/awesome-new-model /path/to/model_folder --token YOUR-MODELSCOPE-TOKEN  （获取令牌：https://modelscope.cn/my/access/token）
+	3. 文档：https://www.modelscope.cn/docs/models/upload
