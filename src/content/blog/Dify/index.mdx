@@ -31,10 +31,10 @@ lftp -u "运控组,123456" ftp://10.139.203.199
 ```
 
 - 长管日报服务器
-- IP：10.139.203.199
+- IP：10.xxx.xxx.199
 - 端口：21
-- 账号：运控组
-- 密码：123456
+- 账号：xxx
+- 密码：xxx
 
 - 进入lftp命令行后，进行单次同步测试
 
@@ -64,12 +64,12 @@ set ftp:charset gbk; set file:charset utf-8; mirror --verbose -I "_.doc" -I "_.d
 #
 
 # ====== 配置区（改这里） ======
-FTP_USER="运控组"                           # FTP 用户名
-FTP_PASS="123456"                             # FTP 密码
-FTP_HOST="10.139.203.199"                  # 远程 Windows 服务器 IP
+FTP_USER="xxx"                           # FTP 用户名
+FTP_PASS="xxx"                             # FTP 密码
+FTP_HOST="10.139.xxx.199"                  # 远程 Windows 服务器 IP
 FTP_REMOTE_DIR="/日报"                     # FTP 上的文档目录路径
 DATASET_ID="8c99af5d-591d-4967-8c5a-2f96540b4fa0"  # 长管日报知识库
-API_KEY="dataset-OP0uo18rhjPUQ7HH4V2Pxwpq"        # Dify API 密钥
+API_KEY="dataset-xxxxxxxxxxxxxx"        # Dify API 密钥
 # ====== 配置区结束 ======
 
 SYNC_HOME="/mnt/d/dify-sync/docs/cg_daily_report"   # 存放同步的所有长管日志
