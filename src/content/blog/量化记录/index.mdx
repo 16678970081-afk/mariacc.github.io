@@ -23,14 +23,17 @@ import { Icon } from 'astro-icon/components'
 ### 2. 准备
 
 0. 准备阶段：使用“更多”--“无卡开机”
-1. 创建并激活虚拟环境
+1. 创建并激活虚拟环境 venv (Virtual Environment)
 
 ``` bash
 python -m venv quant
 source quant/bin/activate
 ```
 
-2. 保存为kernel，Jupyter notebook选择创建的kernel
+2. 保存为kernel(Jupyter Kernel，运行时的配置描述符，描述指向的python解释器)
+	+ Jupyter Kernel： Jupyter 本身是一个 Web 应用程序，不运行代码。当选择一个 Kernel 时，它会根据注册的路径启动对应的 Python 解释器进程。
+	+ ipykernel： Jupyter 界面本身不具备运行代码的能力。ipykernel 是一个运行在背景中的进程，它负责接收 Jupyter 前端发来的代码（通过 ZeroMQ 协议），在指定的 Python 环境中执行，再把结果（报错、图片、文本）传回前端。
+	+ ipykernel install： 注册一个 JSON 描述文件，使得 Jupyter Notebook 界面能够识别并调用刚刚创建的 quant 虚拟环境。
 
 ``` bash
 pip install ipykernel
@@ -60,15 +63,18 @@ modelscope download --model Qwen/Qwen3.5-27B --local_dir /root/autodl-fs/models/
 0. 激活quant虚拟环境
 1. 安装 llmcompressor 依赖
 	1. ` pip install llmcompressor -i https://pypi.tuna.tsinghua.edu.cn/simple`
-	2.  遇到的问题：
+	2.  遇到的问题：llmcompressor v0.10 锁定的transformer版本无法支持 Qwen3.5 架构
 		1. 加载模型时报错：ValueError: The checkpoint you are trying to load has model type `qwen3_5` but Transformers does not recognize this architecture. This could be because of an issue with the checkpoint, or because your version of Transformers is out of date. 要求升级 Transformers；升级后会再次报错：Transformers 最新5.x要求llmcompressor的版本为0.11以上，但是使用pip升级llmcompressor最新的也只能升级到0.10
-		2. 原因：llmcompressor 一起装的 transformers 还没有内置 Qwen3.5架构		
+		2. 原因：llmcompressor 安装时锁定的 transformers 是旧版，还没有内置 Qwen3.5架构，如果为了适配qwen3.5新架构去升级transformer会导致新版的transformer不适配从pypi仓库安装的llmcompressor		
 		<Callout title="llmcompressor建议" variant="note">
 		"Qwen 3.5 can now be quantized using LLM Compressor. You will need to update your local transformers version using uv pip install --upgrade transformers and install LLM Compressor from source if using \<0.11."
 		</Callout>
 	3. 解决方法：
-		1. 参考issue：https://github.com/vllm-project/llm-compressor/issues/2535 ------先装源码、再升 transformers
+		1. 参考issue：https://github.com/vllm-project/llm-compressor/issues/2535 ------先从源码安装最新版本、再升 transformers
 
+		+ pip install是从pypi上下载安装的方法，版本可能晚于github上的源码版本
+		+ pip install -e . 以“可编辑模式”从源码安装，如果不使用 -e，每次改动了 llm-compressor 的代码，都得重新打包安装（软链接安装，Python 解释器运行时，会直接去llmcompressor的本地源码目录读代码。）---为什么这一步还要带镜像源：安装llmcompressor时还要下载它依赖的其他库
+		+ 强制手动升级 transformers 和预发布版（pre-release）的 compressed-tensors 库
 
 ``` bash
 git clone https://github.com/vllm-project/llm-compressor.git
@@ -89,9 +95,32 @@ from llmcompressor import oneshot
 from llmcompressor.modifiers.awq import AWQModifier
 ```
 
-#### 2. 加载模型（text-only）
++ Transformers---加载模型类，即模型架构定义（规定了模型有多少层、每层如何连接。）的选择： 	
+1. 显式指定还是自动路由AutoModelForCausalLM？
+	+ Qwen3.5-27B 是多模态 VLM，不是纯文本 llm。用` AutoModelForCausalLM `加载会有隐患:
+	1. 它的顶层 model_type 是 qwen3_5（VLM 复合配置），文本子配置才是 qwen3_5_text。AutoModelForCausalLM 在新版 transformers 里通常会自动路由到 `Qwen3_5ForCausalLM`（仅文本部分），但也可能因为 config 路径报错。
+2. 专门处理多模态的 Qwen3_5ForConditionalGeneration 还是 仅关注文本部分的 Qwen3_5ForCausalLM
+	+ 用Qwen3_5ForConditionalGeneration：视觉部分权重同样占用显存；
+	+ 但是用Qwen3_5ForCausalLM去加载模型，丢弃视觉部分不会引发报错，会静默丢弃视觉权重（因为内部声明 `keys_to_ignore_on_load_unexpected = [r"^model.visual.*"]`），成为一个纯文本 LLM。如果要做完整的多模态推理/量化，应该用 `Qwen3_5ForConditionalGeneration`。
 
+#### 2. 加载模型（text-only for this one）
+
+加载模型：（从磁盘到gpu）
++ device_map="auto"，启动Accelerate调度器进行资源自动分配：
+	+ Python 不会一次性把 54GB 塞进 CPU 内存再转运到gpu，而是通过 Accelerate 库的机制，计算出每一层（Layer）的大小，然后像“填空”一样，将磁盘里的数据直接映射到显卡的不同地址段；如果显存全满了，它会将剩下的层（Layers）“卸载（Offload）”到 CPU 甚至磁盘。
+	+ 如果是device_map：None，会遵循 PyTorch 的默认行为（通常是 CPU）。
++ dtype="auto" ：
+	+ 自动读取权重文件（如 .safetensors）的头部信息（Metadata），识别模型的权重精度是“怎么存”的（ BF16 ），为了指挥显卡分配对应精度的空间。如果原权重是 BF16，它就尝试以 BF16 加载。如果强制指定加载时 torch_dtype=torch.float8，transformers 会尝试在加载过程中进行实时的强制数据类型转换，可能导致输出乱码。
+	+ 那为什么还要保留这个参数： 元数据中的精度是权重的存储精度，不同于推理时的精度，在推理时可能想用 FP16 来加速，或者显卡不支持 BF16。此时dtype 参数就充当了强制转换器。
++ trust_remote_code=True：
+	+ 该参数决定是否允许执行从模型仓库下载下来的 Python 脚本（开启执行模型包含的python脚本权限）
+	+ 为什么要这样：有些模型包含自定义的算子或特殊的层结构。由于这些逻辑没写在 transformers 官方库里，模型开发者会将代码放在模型文件夹中。开启此项后，import机制会动态加载并运行这些外部脚本，补充transformers 官方库里没有的部分。
+
+加载分词器：
 + 纯文本的process选AutoTokenizer，没有图像输入，tokenizer 够用，如果多模态选AutoProcessor
+
+
+
 ``` python
 MODEL_ID = "/root/autodl-fs/models/Qwen3.5-27B"
 
@@ -104,23 +133,28 @@ model = Qwen3_5ForCausalLM.from_pretrained(
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
 ```
 遇到的问题：
-1. Qwen3.5-27B 是多模态 VLM，不是纯文本 llm。用` AutoModelForCausalLM `加载会有两个隐患:
-	1. . 它的顶层 model_type 是 qwen3_5（VLM 复合配置），文本子配置才是 qwen3_5_text。AutoModelForCausalLM 在新版 transformers 里通常会自动路由到 `Qwen3_5ForCausalLM`（仅文本部分），但也可能因为 config 路径报错。
-	2. 如果要做完整的多模态推理/量化，应该用 `Qwen3_5ForConditionalGeneration`。
-2. Qwen3_5ForCausalLM 内部声明 `keys_to_ignore_on_load_unexpected = [r"^model.visual.*"]`，所以可以直接从 VLM 完整 checkpoint 加载，vision 权重会被静默丢弃
-3. 量化时，显存不足oom：
-	1. 显式 CPU offload，让加载时就把部分层放 CPU，sequential pipeline 会按需搬运，max_memory 给 GPU 设上限到 55GB（一半模型 + 量化 workspace）；如果还不够，把 55GiB 改成 40GiB 让一半权重直接落 CPU。
-``` python add={5-6}
+
+1. 加载模型时（从磁盘到gpu生成动态计算图形），出现显存不足oom：
+	+ 方案一： 如上，只加载vlm的文本生成部分：Qwen3_5ForConditionalGeneration改成Qwen3_5ForCausalLM
+	+ 方案二： 限制gpu的最大占用，剩下的权重放cpu或者落盘：
+		+ 按照 GPU（max_memory） -> CPU -> Disk 的优先级顺序摆放权重张量tensor。这一步是逻辑占位，transformers 配合 accelerate 库，首先在逻辑上构建完整的模型结构。它给每个权重分配一个“虚拟地址”，就像在地图上划好了地块。
+		+ 动态交换（The Swap）：模型是逐层进行的。当算到第 20 层时，如果这一层在磁盘上，系统会把第 19 层的空间腾出来，把第 20 层从磁盘“映射”进显存。就是 Sequential Pipeline。（内存映射：操作系统并不真的把文件读入内存，而是建立一个指向磁盘文件的指针映射）
+		+ offload_state_dict：允许将模型状态字典（权重）在加载过程中进行磁盘映射。
+		+ device_map="auto" 只是默认占用全部gpu，启用了Accelerate调度器，并不冲突
+
+``` python add={5-7}
 model = Qwen3_5ForCausalLM.from_pretrained(
     MODEL_ID,
     dtype="auto",
     device_map="auto",
-    max_memory={0: "55GiB", "cpu": "200GiB"},   # ← 主动给 GPU 留 25G 空间
+    max_memory={0: "55GiB", "cpu": "200GiB"},   # ← 主动给 GPU 留 25G 空间作为计算缓冲区
     offload_folder="/root/autodl-tmp/offload",   # 必要时落盘
     offload_state_dict=True,
     trust_remote_code=True,
 )
 ```
+
++ offload_state_dict=True：允许程序在加载权重（State Dict）时，不将其完整地读入系统内存（RAM），而是通过内存映射（Memory Mapping）技术直接与磁盘上的 offload_folder 关联，防止内存也oom
 
 #### 3. 校准数据
 
@@ -198,7 +232,7 @@ recipe = AWQModifier(
 	],
 )
 ```
-
+加载器像一个过滤器。它逐一读取权重键名（Key），当碰撞到正则表达式 r"^model.visual.*" 时，加载机制会触发“忽略逻辑”，而不将其视为权重丢失（Incomplete Checkpoint）。这样，模型在显存中只构建了文本部分的计算图。
 
 
 #### 5. ons-shot量化

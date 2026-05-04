@@ -1,0 +1,31 @@
+---
+title: '概念'
+description: '运行量化脚本'
+date: 2026-05-01
+tags: ['quant']
+authors: ['maria']
+order: 2
+---
+
+BF16 与 Float16：同门不同路 📏
+性质判定：单纯操作（事实陈述）
+
+事实陈述：BF16 (Brain Floating Point) 和 Float16 (Half Precision) 都是 16 位浮点数，但它们的“内存布局”不同。
+
+关键差异：Float16 牺牲了数值范围来换取精度；而 BF16 拥有与 Float32 相同的数值范围（指数位长度一致），只是精度较低。
+
+学术结论：在大模型训练中，BF16 能更好地防止梯度溢出。对于 A800 这种现代显卡，BF16 是首选，它们在物理层面不是同一种东西。
+
+
+Tensor（张量）：数学/物理上的多维数组。是底层基石。它只是存储数字的容器（数组）。
+
+Parameter（参数）：Tensor 的一种特殊封装，能被优化器更新。当 Tensor 被标记为 requires_grad=True 并放进神经网络层时，它就成了 Parameter。
+
+Weight（权重）：神经网络中具体的连接强度数值（通常是 Parameter 的一种）。
+
+State Dict（状态字典）：一个 Python 字典对象，将每一层的名字映射到对应的 Tensor 上。State Dict 是管理者。它把模型中所有的 Weight 和 Parameter 收集起来，贴上标签（Key），封存在一个字典（Value）里。
+为什么加载模型时，我们更倾向于说“加载 state dict”，而不是说“加载 parameters”？
+
+Parameters 视角：包含梯度信息，适合训练。但在保存模型时，梯度信息往往是多余的。
+
+State Dict 视角：只包含“状态”（即数值和键值对）。它是最轻量、最通用的交换格式
