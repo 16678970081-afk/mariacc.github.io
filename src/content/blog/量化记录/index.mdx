@@ -158,6 +158,7 @@ model = Qwen3_5ForCausalLM.from_pretrained(
 
 #### 3. 校准数据
 
++ 校准解决了量化中的 “动态范围探测” 问题。大模型的权重和激活值分布极不均匀。如果不先用 512 个样本跑一遍模型，就不知道每一层输出的数值范围（比如是从 -100 到 100，还是 -0.1 到 0.1）。一旦范围找错，量化时的截断（Clipping）就会导致严重的信息丢失，模型输出就会变成乱码。
 + AWQ 是数据驱动算法，如果是NVFP4A16就不需要数据校准了
 
 3.1 配置参数
@@ -165,6 +166,9 @@ model = Qwen3_5ForCausalLM.from_pretrained(
 NUM_CALIBRATION_SAMPLES = 512 # 27B MoE 建议 ≥ 512，dense 256 即可
 MAX_SEQUENCE_LENGTH = 2048
 ```
++ NUM_CALIBRATION_SAMPLES 校准样本数
++ MAX_SEQUENCE_LENGTH 最大序列长度（每条文本的最大长度）
+
 遇到的问题：
 * 量化时，显存不足 oom：把序列长度砍半（这一步省下的显存最多，激活内存随 seq_len 线性增长）：
 	+ NUM_CALIBRATION_SAMPLES降为256
@@ -178,6 +182,12 @@ ds = load_dataset(
 )
 ds = ds.shuffle(seed=42)
 ```
+
++ 为什么选train_sft不选gen：
+	+ train_sft (Supervised Fine-Tuning)：这部分数据通常是“问题-答案”对，且答案是由人类专家或高质量模型编写的。它的激活分布非常稳定且符合逻辑规律。
+	+ gen (Generation)：这通常指模型自生成的原始输出。由于量化前模型（FP16）已经经过了 SFT，它的 SFT 轨道数据更能代表其“巅峰状态”下的神经元触发模式。如果选 gen 且其中包含大量低质量或发散的回复，校准得到的缩放系数（Scaling Factor）会偏离真实应用场景，导致量化后模型变“傻”。
+
+
 遇到的问题：
 + 网络问题无法下载-----从modelscope上下载数据集
 	+ swift/ultrachat_200k 是 HuggingFaceH4/ultrachat_200k 的镜像
@@ -194,6 +204,8 @@ ds = load_dataset(
 ds = ds.shuffle(seed=42)
 ```
 
++ 加载 ultrachat_200k 数据集的 SFT（监督微调）训练集部分
++ ds.shuffle：使用固定随机种子 42 进行了全局打乱，以保证样本的随机性和实验的可重复性。
 3.3
 ``` python
 def preprocess(example):
